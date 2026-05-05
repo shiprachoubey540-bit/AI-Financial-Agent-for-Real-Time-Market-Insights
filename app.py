@@ -1,609 +1,589 @@
-"""
-============================================================
-AI FINANCIAL AGENT — ZOMATO IPO SENTIMENT ANALYSIS
-DEPLOYMENT: app.py  (Flask REST API + Web UI)
-============================================================
-Run:
-    python app.py
-
-Endpoints:
-    GET  /              → Web dashboard UI
-    POST /predict       → Single text prediction (JSON)
-    POST /predict_batch → Batch prediction (JSON list)
-    GET  /health        → Health check
-    GET  /models        → List loaded models
-============================================================
-"""
-
-from flask import Flask, request, jsonify, render_template_string
-import pickle, os, re, time
+import streamlit as st
+import pandas as pd
 import numpy as np
-import warnings
-warnings.filterwarnings("ignore")
+import pickle
+import os
+import re
+import plotly.express as px
+import plotly.graph_objects as go
 
-# ── Optional: VADER for confidence scores ─────────────────────────────────
-try:
-    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-    vader = SentimentIntensityAnalyzer()
-    VADER_OK = True
-except ImportError:
-    VADER_OK = False
+# ─── Page Config ─────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="AI Financial Agent · Zomato IPO",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-app = Flask(__name__)
-
-# ── Model registry ─────────────────────────────────────────────────────────
-MODEL_DIR   = "models"
-LABEL_MAP   = {0: "Negative 📉", 1: "Neutral ➡️", 2: "Positive 📈"}
-LABEL_COLOR = {0: "#E74C3C",     1: "#F39C12",    2: "#27AE60"}
-
-loaded_models     = {}
-tfidf_vectorizer  = None
-
-
-def clean_text(text: str) -> str:
-    text = str(text).lower()
-    text = re.sub(r"http\S+|www\S+", "", text)
-    text = re.sub(r"@\w+", "", text)
-    text = re.sub(r"#(\w+)", r"\1", text)
-    text = re.sub(r"[^\w\s]", " ", text)
-    text = re.sub(r"\d+", "", text)
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def load_models():
-    """Load all .pkl models and the TF-IDF vectorizer at startup."""
-    global tfidf_vectorizer
-
-    if not os.path.exists(MODEL_DIR):
-        print(f"[WARN] {MODEL_DIR}/ not found — run save_models_notebook_cell.py first")
-        return
-
-    # Load vectorizer
-    vec_path = os.path.join(MODEL_DIR, "tfidf_vectorizer.pkl")
-    if os.path.exists(vec_path):
-        with open(vec_path, "rb") as f:
-            tfidf_vectorizer = pickle.load(f)
-        print("✅ TF-IDF vectorizer loaded")
-    else:
-        print("[WARN] tfidf_vectorizer.pkl not found")
-
-    # Load all classifier pkl files
-    model_files = {
-        "logistic_regression": "logistic_regression.pkl",
-        "svm":                 "svm_model.pkl",
-        "naive_bayes":         "naive_bayes.pkl",
-        "random_forest":       "random_forest.pkl",
-        "gradient_boosting":   "gradient_boosting.pkl",
-    }
-
-    for name, fname in model_files.items():
-        fpath = os.path.join(MODEL_DIR, fname)
-        if os.path.exists(fpath):
-            with open(fpath, "rb") as f:
-                loaded_models[name] = pickle.load(f)
-            print(f"✅ Loaded: {name}")
-        else:
-            print(f"[SKIP] Not found: {fname}")
-
-    print(f"\n📦 {len(loaded_models)} model(s) ready for inference")
-
-
-def predict_sentiment(text: str, model_name: str = "logistic_regression"):
-    """Core prediction function — returns label, confidence, vader score."""
-    if not loaded_models:
-        return {"error": "No models loaded. Run save_models_notebook_cell.py first."}
-
-    if model_name not in loaded_models:
-        model_name = list(loaded_models.keys())[0]
-
-    clean   = clean_text(text)
-    clf     = loaded_models[model_name]
-
-    if tfidf_vectorizer:
-        X = tfidf_vectorizer.transform([clean])
-    else:
-        return {"error": "TF-IDF vectorizer not loaded."}
-
-    pred    = int(clf.predict(X)[0])
-    label   = LABEL_MAP[pred]
-    color   = LABEL_COLOR[pred]
-
-    # Confidence
-    if hasattr(clf, "predict_proba"):
-        proba   = clf.predict_proba(X)[0].tolist()
-        confidence = round(max(proba) * 100, 1)
-    elif hasattr(clf, "decision_function"):
-        scores  = clf.decision_function(X)[0]
-        exp     = np.exp(scores - scores.max())
-        proba   = (exp / exp.sum()).tolist()
-        confidence = round(max(proba) * 100, 1)
-    else:
-        proba, confidence = [], 0.0
-
-    # VADER supplementary
-    vader_compound = 0.0
-    if VADER_OK:
-        vader_compound = round(vader.polarity_scores(text)["compound"], 4)
-
-    # Financial signal
-    if pred == 2:
-        signal = "BULLISH 🟢 — Positive market sentiment detected"
-    elif pred == 0:
-        signal = "BEARISH 🔴 — Negative market sentiment detected"
-    else:
-        signal = "NEUTRAL ⚪ — Market sentiment is mixed"
-
-    return {
-        "input_text":     text,
-        "cleaned_text":   clean,
-        "model_used":     model_name,
-        "sentiment_code": pred,
-        "sentiment":      label,
-        "color":          color,
-        "confidence":     confidence,
-        "probabilities":  {
-            "negative": round(proba[0] * 100, 1) if proba else 0,
-            "neutral":  round(proba[1] * 100, 1) if proba else 0,
-            "positive": round(proba[2] * 100, 1) if proba else 0,
-        },
-        "vader_compound": vader_compound,
-        "financial_signal": signal,
-    }
-
-
-# ==========================================================================
-# ROUTES
-# ==========================================================================
-
-@app.route("/health")
-def health():
-    return jsonify({
-        "status":        "ok",
-        "models_loaded": list(loaded_models.keys()),
-        "vectorizer":    tfidf_vectorizer is not None,
-        "timestamp":     time.strftime("%Y-%m-%d %H:%M:%S"),
-    })
-
-
-@app.route("/models")
-def list_models():
-    return jsonify({
-        "available_models": list(loaded_models.keys()),
-        "default_model":    list(loaded_models.keys())[0] if loaded_models else None
-    })
-
-
-@app.route("/predict", methods=["POST"])
-def predict():
-    """
-    POST /predict
-    Body: { "text": "...", "model": "logistic_regression" }
-    """
-    data = request.get_json(force=True)
-    if not data or "text" not in data:
-        return jsonify({"error": "Missing 'text' field in request body"}), 400
-
-    model_name = data.get("model", "logistic_regression")
-    result     = predict_sentiment(data["text"], model_name)
-    return jsonify(result)
-
-
-@app.route("/predict_batch", methods=["POST"])
-def predict_batch():
-    """
-    POST /predict_batch
-    Body: { "texts": ["...", "..."], "model": "logistic_regression" }
-    """
-    data = request.get_json(force=True)
-    if not data or "texts" not in data:
-        return jsonify({"error": "Missing 'texts' field (list) in request body"}), 400
-
-    model_name = data.get("model", "logistic_regression")
-    results    = [predict_sentiment(t, model_name) for t in data["texts"]]
-
-    # Summary stats
-    sentiments = [r["sentiment_code"] for r in results if "sentiment_code" in r]
-    summary = {
-        "total":    len(results),
-        "positive": sentiments.count(2),
-        "neutral":  sentiments.count(1),
-        "negative": sentiments.count(0),
-        "overall_signal": (
-            "BULLISH 🟢" if sentiments.count(2) > sentiments.count(0)
-            else "BEARISH 🔴" if sentiments.count(0) > sentiments.count(2)
-            else "NEUTRAL ⚪"
-        )
-    }
-    return jsonify({"summary": summary, "results": results})
-
-
-# ==========================================================================
-# WEB DASHBOARD UI
-# ==========================================================================
-
-DASHBOARD_HTML = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>AI Financial Agent — Zomato IPO Sentiment</title>
-<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;600;700&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+# ─── Custom CSS ───────────────────────────────────────────────────────────────
+st.markdown("""
 <style>
-  :root {
-    --bg: #0A0E1A;
-    --card: #111827;
-    --border: #1F2937;
-    --accent: #F59E0B;
-    --green: #10B981;
-    --red: #EF4444;
-    --yellow: #F59E0B;
-    --text: #F9FAFB;
-    --muted: #6B7280;
-    --font: 'Space Grotesk', sans-serif;
-    --mono: 'JetBrains Mono', monospace;
-  }
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body {
-    background: var(--bg);
-    color: var(--text);
-    font-family: var(--font);
-    min-height: 100vh;
-  }
+@import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;700;800&family=DM+Sans:ital,wght@0,300;0,400;0,500;1,300&display=swap');
 
-  /* NAV */
-  nav {
-    display: flex; align-items: center; justify-content: space-between;
-    padding: 1rem 2rem;
-    border-bottom: 1px solid var(--border);
-    background: rgba(17,24,39,0.8);
-    backdrop-filter: blur(8px);
-    position: sticky; top: 0; z-index: 100;
-  }
-  .logo { font-weight: 700; font-size: 1.1rem; letter-spacing: -0.02em; }
-  .logo span { color: var(--accent); }
-  .status-pill {
-    display: flex; align-items: center; gap: 0.5rem;
-    font-size: 0.8rem; color: var(--muted);
-    background: var(--border); padding: 0.4rem 0.8rem; border-radius: 999px;
-  }
-  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green);
-         animation: pulse 2s infinite; }
-  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
 
-  /* LAYOUT */
-  .container { max-width: 1100px; margin: 0 auto; padding: 2rem 1.5rem; }
+[data-testid="stSidebar"] {
+    background: #0d0d0d !important;
+    border-right: 1px solid #222;
+}
+[data-testid="stSidebar"] * { color: #e0e0e0 !important; }
 
-  /* HERO */
-  .hero { text-align: center; padding: 3rem 0 2rem; }
-  .hero h1 {
-    font-size: clamp(2rem, 5vw, 3.5rem);
-    font-weight: 700; letter-spacing: -0.03em;
-    line-height: 1.1;
-  }
-  .hero h1 em { font-style: normal; color: var(--accent); }
-  .hero p { color: var(--muted); margin-top: 1rem; font-size: 1.05rem; }
+.main { background: #f7f5f0; }
 
-  /* CARDS */
-  .card {
-    background: var(--card);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 1.5rem;
-  }
-  .card-title {
-    font-size: 0.75rem; font-weight: 600;
-    text-transform: uppercase; letter-spacing: 0.1em;
-    color: var(--muted); margin-bottom: 1rem;
-  }
+.hero-title {
+    font-family: 'Syne', sans-serif;
+    font-size: 2.8rem; font-weight: 800;
+    color: #0d0d0d; letter-spacing: -0.03em; line-height: 1.1;
+}
+.hero-sub {
+    font-size: 1rem; color: #666; font-weight: 300; margin-top: 0.4rem;
+}
+.section-header {
+    font-family: 'Syne', sans-serif;
+    font-size: 1.3rem; font-weight: 700; color: #0d0d0d;
+    border-left: 4px solid #f7c948;
+    padding-left: 0.75rem; margin: 1.5rem 0 0.8rem 0;
+}
+.metric-card {
+    background: #0d0d0d; border-radius: 12px;
+    padding: 1.2rem 1.4rem; color: white;
+}
+.metric-card .label {
+    font-size: 0.7rem; letter-spacing: 0.12em;
+    text-transform: uppercase; color: #777; margin-bottom: 0.3rem;
+}
+.metric-card .value {
+    font-family: 'Syne', sans-serif; font-size: 2rem;
+    font-weight: 700; color: #f7c948;
+}
+.metric-card .delta { font-size: 0.78rem; color: #aaa; margin-top: 0.2rem; }
 
-  /* GRID */
-  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; margin-top: 2rem; }
-  .grid-3 { display: grid; grid-template-columns: repeat(3,1fr); gap: 1rem; margin-top: 1.5rem; }
-  @media(max-width:700px){ .grid-2,.grid-3{ grid-template-columns:1fr; } }
-
-  /* INPUT AREA */
-  .input-section { margin-top: 2rem; }
-  .input-row { display: flex; gap: 1rem; align-items: flex-end; flex-wrap: wrap; }
-  textarea {
-    flex: 1; min-width: 250px;
-    background: var(--card); border: 1px solid var(--border);
-    border-radius: 8px; color: var(--text);
-    font-family: var(--font); font-size: 0.95rem;
-    padding: 1rem; resize: vertical; min-height: 100px;
-    outline: none; transition: border-color 0.2s;
-  }
-  textarea:focus { border-color: var(--accent); }
-  select {
-    background: var(--card); border: 1px solid var(--border);
-    color: var(--text); font-family: var(--font);
-    padding: 0.6rem 1rem; border-radius: 8px;
-    font-size: 0.9rem; cursor: pointer;
-  }
-  .btn {
-    background: var(--accent); color: #000;
-    border: none; border-radius: 8px;
-    padding: 0.75rem 2rem; font-family: var(--font);
-    font-weight: 700; font-size: 0.95rem; cursor: pointer;
-    transition: transform 0.1s, opacity 0.2s;
-    white-space: nowrap;
-  }
-  .btn:hover { opacity: 0.9; transform: translateY(-1px); }
-  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
-
-  /* RESULT */
-  #result-card {
-    margin-top: 1.5rem; display: none;
-    border-radius: 12px; overflow: hidden;
-  }
-  .result-header {
-    padding: 1.2rem 1.5rem;
-    display: flex; align-items: center; justify-content: space-between;
-    flex-wrap: wrap; gap: 1rem;
-  }
-  .sentiment-badge {
-    font-size: 1.6rem; font-weight: 700; letter-spacing: -0.02em;
-  }
-  .confidence {
-    font-family: var(--mono); font-size: 0.9rem;
-    background: rgba(0,0,0,0.3); padding: 0.4rem 0.8rem; border-radius: 6px;
-  }
-  .result-body { padding: 1.2rem 1.5rem; background: rgba(0,0,0,0.25); }
-  .signal-box {
-    font-weight: 600; font-size: 1rem;
-    padding: 0.8rem 1rem; border-radius: 8px;
-    background: rgba(255,255,255,0.06);
-    margin-bottom: 1rem;
-  }
-
-  /* PROB BARS */
-  .prob-row { display: flex; align-items: center; gap: 0.8rem; margin: 0.4rem 0; }
-  .prob-label { width: 70px; font-size: 0.82rem; color: var(--muted); }
-  .prob-track {
-    flex: 1; height: 8px; background: var(--border); border-radius: 4px; overflow: hidden;
-  }
-  .prob-fill { height: 100%; border-radius: 4px; transition: width 0.6s ease; }
-  .prob-val { width: 42px; font-family: var(--mono); font-size: 0.78rem; text-align: right; }
-
-  /* STAT CHIPS */
-  .chip {
-    background: var(--border); border-radius: 8px;
-    padding: 1rem; text-align: center;
-  }
-  .chip-val { font-size: 1.5rem; font-weight: 700; }
-  .chip-lbl { font-size: 0.72rem; color: var(--muted); margin-top: 0.3rem; }
-
-  /* API DOCS */
-  .api-section { margin-top: 3rem; }
-  pre {
-    background: #0D1117; border: 1px solid var(--border);
-    border-radius: 8px; padding: 1rem;
-    font-family: var(--mono); font-size: 0.8rem;
-    color: #79C0FF; overflow-x: auto; white-space: pre-wrap;
-  }
-  .method { font-size: 0.7rem; font-weight: 700; font-family: var(--mono);
-            padding: 0.2rem 0.5rem; border-radius: 4px; margin-right: 0.5rem; }
-  .post { background: #10B981; color: #000; }
-  .get  { background: #3B82F6; color: #fff; }
-  .endpoint-row { display: flex; align-items: center; margin: 0.5rem 0;
-                  font-family: var(--mono); font-size: 0.85rem; }
-
-  /* LOADER */
-  .spinner {
-    display: inline-block; width: 16px; height: 16px;
-    border: 2px solid #000; border-top-color: transparent;
-    border-radius: 50%; animation: spin 0.6s linear infinite;
-  }
-  @keyframes spin { to { transform: rotate(360deg); } }
-
-  footer {
-    text-align: center; padding: 3rem 1rem 2rem;
-    color: var(--muted); font-size: 0.82rem; border-top: 1px solid var(--border);
-    margin-top: 4rem;
-  }
+.pred-positive {
+    background: #d4f5e2; border: 2px solid #1a6b3c;
+    border-radius: 12px; padding: 1.5rem; text-align: center;
+}
+.pred-negative {
+    background: #fde8e8; border: 2px solid #9b1c1c;
+    border-radius: 12px; padding: 1.5rem; text-align: center;
+}
+.pred-neutral {
+    background: #fff3cd; border: 2px solid #856404;
+    border-radius: 12px; padding: 1.5rem; text-align: center;
+}
+.pred-label {
+    font-family: 'Syne', sans-serif; font-size: 1.8rem; font-weight: 800;
+}
+.pred-confidence { font-size: 0.9rem; color: #555; margin-top: 0.3rem; }
+.thin-divider { border: none; border-top: 1px solid #ddd; margin: 1.2rem 0; }
+#MainMenu, footer { visibility: hidden; }
 </style>
-</head>
-<body>
+""", unsafe_allow_html=True)
 
-<nav>
-  <div class="logo">AI <span>Financial</span> Agent</div>
-  <div class="status-pill"><span class="dot"></span> Live · Zomato IPO Sentiment</div>
-</nav>
+# ─── Load Models ──────────────────────────────────────────────────────────────
+@st.cache_resource
+def load_models():
+    models = {}
+    for fname, key in [("best_model.pkl","classifier"),
+                       ("tfidf_vectorizer.pkl","vectorizer"),
+                       ("label_encoder.pkl","label_encoder")]:
+        try:
+            with open(fname, "rb") as f:
+                models[key] = pickle.load(f)
+        except FileNotFoundError:
+            models[key] = None
+    return models
 
-<div class="container">
+models = load_models()
 
-  <div class="hero">
-    <h1>Real-Time <em>Market Sentiment</em><br>from Social Signals</h1>
-    <p>Analyse tweets, reviews & news to generate financial market signals for Zomato IPO</p>
-  </div>
+# ─── Load CSVs ────────────────────────────────────────────────────────────────
+DATA_DIR = "cleaned_data"
 
-  <!-- Stats row -->
-  <div class="grid-3">
-    <div class="chip">
-      <div class="chip-val" id="stat-models">—</div>
-      <div class="chip-lbl">Models Loaded</div>
-    </div>
-    <div class="chip">
-      <div class="chip-val">3</div>
-      <div class="chip-lbl">Sentiment Classes</div>
-    </div>
-    <div class="chip">
-      <div class="chip-val" id="stat-vec">—</div>
-      <div class="chip-lbl">Vectorizer</div>
-    </div>
-  </div>
+@st.cache_data
+def load_csv(filename):
+    path = os.path.join(DATA_DIR, filename)
+    return pd.read_csv(path) if os.path.exists(path) else None
 
-  <!-- Input section -->
-  <div class="input-section card" style="margin-top:1.5rem;">
-    <div class="card-title">📊 Analyse Text</div>
-    <div class="input-row">
-      <textarea id="input-text"
-        placeholder="Enter a tweet, review, or news headline about Zomato IPO...&#10;&#10;e.g. 'Zomato IPO subscribed 38x — huge investor confidence!'"></textarea>
-      <div style="display:flex;flex-direction:column;gap:0.8rem;">
-        <div>
-          <label style="font-size:0.78rem;color:var(--muted);display:block;margin-bottom:0.4rem;">Model</label>
-          <select id="model-select">
-            <option value="logistic_regression">Logistic Regression</option>
-            <option value="svm">Linear SVM</option>
-            <option value="naive_bayes">Naive Bayes</option>
-            <option value="random_forest">Random Forest</option>
-            <option value="gradient_boosting">Gradient Boosting</option>
-          </select>
-        </div>
-        <button class="btn" id="predict-btn" onclick="predictSentiment()">
-          Analyse →
-        </button>
-      </div>
-    </div>
-
-    <!-- Result -->
-    <div id="result-card">
-      <div class="result-header" id="result-header">
-        <div class="sentiment-badge" id="result-label">—</div>
-        <div class="confidence" id="result-confidence">—</div>
-      </div>
-      <div class="result-body">
-        <div class="signal-box" id="result-signal">—</div>
-        <div style="font-size:0.8rem;color:var(--muted);margin-bottom:0.8rem;">Probability Distribution</div>
-        <div class="prob-row">
-          <span class="prob-label">Negative</span>
-          <div class="prob-track"><div class="prob-fill" id="bar-neg" style="background:#EF4444;width:0%"></div></div>
-          <span class="prob-val" id="val-neg">0%</span>
-        </div>
-        <div class="prob-row">
-          <span class="prob-label">Neutral</span>
-          <div class="prob-track"><div class="prob-fill" id="bar-neu" style="background:#F59E0B;width:0%"></div></div>
-          <span class="prob-val" id="val-neu">0%</span>
-        </div>
-        <div class="prob-row">
-          <span class="prob-label">Positive</span>
-          <div class="prob-track"><div class="prob-fill" id="bar-pos" style="background:#10B981;width:0%"></div></div>
-          <span class="prob-val" id="val-pos">0%</span>
-        </div>
-        <div style="margin-top:1rem;font-size:0.78rem;color:var(--muted);">
-          VADER Score: <span id="result-vader" style="font-family:var(--mono);color:var(--text);">—</span>
-          &nbsp;|&nbsp; Model: <span id="result-model" style="font-family:var(--mono);color:var(--text);">—</span>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- API Docs -->
-  <div class="api-section">
-    <div class="card-title" style="margin-bottom:1rem;">🔌 API Endpoints</div>
-    <div class="card">
-      <div class="endpoint-row"><span class="method post">POST</span>/predict</div>
-      <pre>curl -X POST http://localhost:5000/predict \\
-  -H "Content-Type: application/json" \\
-  -d '{"text": "Zomato IPO oversubscribed!", "model": "logistic_regression"}'</pre>
-
-      <div class="endpoint-row" style="margin-top:1rem;"><span class="method post">POST</span>/predict_batch</div>
-      <pre>curl -X POST http://localhost:5000/predict_batch \\
-  -H "Content-Type: application/json" \\
-  -d '{"texts": ["Great IPO!", "Bad listing day"], "model": "svm"}'</pre>
-
-      <div class="endpoint-row" style="margin-top:1rem;"><span class="method get">GET</span>/health</div>
-      <pre>curl http://localhost:5000/health</pre>
-    </div>
-  </div>
-
-</div><!-- /container -->
-
-<footer>AI Financial Agent · Zomato IPO Sentiment Analysis · Group Project</footer>
-
-<script>
-  // Load health on page load
-  fetch('/health').then(r => r.json()).then(d => {
-    document.getElementById('stat-models').textContent = d.models_loaded.length;
-    document.getElementById('stat-vec').textContent    = d.vectorizer ? '✅ TF-IDF' : '❌ Missing';
-
-    // Populate model select with actual loaded models
-    const sel = document.getElementById('model-select');
-    sel.innerHTML = '';
-    (d.models_loaded.length ? d.models_loaded : ['logistic_regression']).forEach(m => {
-      const opt = document.createElement('option');
-      opt.value = m;
-      opt.textContent = m.replace(/_/g,' ').replace(/\b\w/g,c=>c.toUpperCase());
-      sel.appendChild(opt);
-    });
-  }).catch(() => {
-    document.getElementById('stat-models').textContent = '?';
-    document.getElementById('stat-vec').textContent = '?';
-  });
-
-  async function predictSentiment() {
-    const text  = document.getElementById('input-text').value.trim();
-    const model = document.getElementById('model-select').value;
-    const btn   = document.getElementById('predict-btn');
-
-    if (!text) { alert('Please enter some text to analyse.'); return; }
-
-    btn.disabled = true;
-    btn.innerHTML = '<span class="spinner"></span>';
-
-    try {
-      const res = await fetch('/predict', {
-        method: 'POST',
-        headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({text, model})
-      });
-      const d = await res.json();
-
-      if (d.error) { alert(d.error); return; }
-
-      // Update UI
-      const card   = document.getElementById('result-card');
-      const header = document.getElementById('result-header');
-      card.style.display = 'block';
-      header.style.background = d.color + '22';
-      header.style.borderBottom = `2px solid ${d.color}`;
-
-      document.getElementById('result-label').textContent      = d.sentiment;
-      document.getElementById('result-confidence').textContent = `${d.confidence}% confidence`;
-      document.getElementById('result-signal').textContent     = d.financial_signal;
-      document.getElementById('result-vader').textContent      = d.vader_compound;
-      document.getElementById('result-model').textContent      = d.model_used;
-
-      const p = d.probabilities;
-      ['neg','neu','pos'].forEach((k,i) => {
-        const keys = ['negative','neutral','positive'];
-        const val  = p[keys[i]] || 0;
-        document.getElementById(`bar-${k}`).style.width = val + '%';
-        document.getElementById(`val-${k}`).textContent = val + '%';
-      });
-
-    } catch(e) {
-      alert('Prediction failed. Is the Flask server running?');
-    } finally {
-      btn.disabled = false;
-      btn.innerHTML = 'Analyse →';
+@st.cache_data
+def load_all_data():
+    return {
+        "ipo_tweets":     load_csv("ipo_tweets_clean.csv"),
+        "reviews":        load_csv("reviews_clean.csv"),
+        "zomato_ipo":     load_csv("zomato-ipo.csv"),
+        "news":           load_csv("news_zomato.csv"),
+        "yt_comments":    load_csv("youtube_comments_zoma.csv"),
+        "yt_videos":      load_csv("youtube_videos_zomato.csv"),
+        "zomato_reviews": load_csv("zomato_reviews.csv"),
     }
-  }
 
-  // Allow Ctrl+Enter to submit
-  document.getElementById('input-text').addEventListener('keydown', e => {
-    if (e.ctrlKey && e.key === 'Enter') predictSentiment();
-  });
-</script>
-</body>
-</html>
-"""
+data = load_all_data()
+
+# ─── Text Preprocessing ───────────────────────────────────────────────────────
+def clean_text(text: str) -> str:
+    text = text.lower()
+    text = re.sub(r"http\S+|www\S+", "", text)
+    text = re.sub(r"@\w+|#\w+", "", text)
+    text = re.sub(r"[^a-z\s]", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+def predict_sentiment(text: str):
+    if not models["vectorizer"] or not models["classifier"]:
+        return None, None, None
+    cleaned = clean_text(text)
+    vec  = models["vectorizer"].transform([cleaned])
+    pred = models["classifier"].predict(vec)[0]
+    proba = (models["classifier"].predict_proba(vec)[0]
+             if hasattr(models["classifier"], "predict_proba") else None)
+    label = (models["label_encoder"].inverse_transform([pred])[0]
+             if models["label_encoder"] else pred)
+    return label, proba, cleaned
+
+LABEL_MAP = {1:"Positive", -1:"Negative", 0:"Neutral",
+             "positive":"Positive", "negative":"Negative", "neutral":"Neutral",
+             "Positive":"Positive", "Negative":"Negative", "Neutral":"Neutral"}
+
+def norm_label(v):
+    return LABEL_MAP.get(v, str(v))
+
+def fmt(n):
+    return f"{n:,}" if isinstance(n, int) else str(n)
+
+# ─── Sidebar ──────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("""
+    <div style='padding:1rem 0 1.5rem 0;'>
+        <div style='font-family:Syne,sans-serif;font-size:1.3rem;font-weight:800;
+                    color:#f7c948;letter-spacing:-0.02em;'>📈 AI Financial</div>
+        <div style='font-size:0.72rem;color:#555;letter-spacing:0.1em;
+                    text-transform:uppercase;margin-top:2px;'>Zomato IPO · Market Agent</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    clf_ok = "✅" if models["classifier"]    else "❌"
+    vec_ok = "✅" if models["vectorizer"]    else "❌"
+    enc_ok = "✅" if models["label_encoder"] else "❌"
+    st.markdown(f"""
+    <div style='background:#1a1a1a;border-radius:8px;padding:0.8rem 1rem;margin-bottom:1.2rem;'>
+        <div style='font-size:0.7rem;color:#777;letter-spacing:0.1em;text-transform:uppercase;
+                    margin-bottom:0.5rem;'>Model Status</div>
+        <div style='font-size:0.82rem;'>{clf_ok} best_model.pkl</div>
+        <div style='font-size:0.82rem;'>{vec_ok} tfidf_vectorizer.pkl</div>
+        <div style='font-size:0.82rem;'>{enc_ok} label_encoder.pkl</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    page = st.radio("Navigation",
+                    ["🏠  Overview", "🔮  Live Prediction", "📊  Data Explorer",
+                     "🤖  Model Performance", "💬  Sentiment Analysis", "📰  News & Social"],
+                    label_visibility="collapsed")
 
 
-@app.route("/")
-def dashboard():
-    return DASHBOARD_HTML
+# ════════════════════════════════════════════════════════════════════════════
+# PAGE 1 · OVERVIEW
+# ════════════════════════════════════════════════════════════════════════════
+if page == "🏠  Overview":
+    st.markdown("""
+    <div class='hero-title'>Zomato IPO<br><span style='color:#f7c948'>Financial Intelligence</span></div>
+    <div class='hero-sub'>NLP-powered sentiment · Real-time market insights · Multi-source data</div>
+    """, unsafe_allow_html=True)
+    st.markdown("<hr class='thin-divider'>", unsafe_allow_html=True)
+
+    col1, col2, col3, col4 = st.columns(4)
+    cards = [("IPO Tweets", data["ipo_tweets"], "Twitter signals"),
+             ("App Reviews", data["reviews"],    "User reviews"),
+             ("News Articles", data["news"],     "Media coverage"),
+             ("YT Comments", data["yt_comments"],"YouTube engagement")]
+    for col, (name, df, desc) in zip([col1,col2,col3,col4], cards):
+        rows = fmt(len(df)) if df is not None else "N/A"
+        with col:
+            st.markdown(f"""
+            <div class='metric-card'>
+                <div class='label'>{name}</div>
+                <div class='value'>{rows}</div>
+                <div class='delta'>{desc}</div>
+            </div>""", unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown("<div class='section-header'>Model Performance</div>", unsafe_allow_html=True)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Logistic Regression", "50.0%",  "Dataset 2")
+    c2.metric("SVM Classifier",      "58.3%",  "Dataset 2 ↑")
+    c3.metric("Best Saved Model",    "Active" if models["classifier"] else "Missing",
+              "best_model.pkl ✅" if models["classifier"] else "Not loaded ❌")
+
+    st.markdown("<div class='section-header'>Dataset Sizes</div>", unsafe_allow_html=True)
+    lmap = {"ipo_tweets":"IPO Tweets","reviews":"App Reviews","news":"News",
+            "yt_comments":"YT Comments","yt_videos":"YT Videos",
+            "zomato_reviews":"Zomato Reviews","zomato_ipo":"IPO Data"}
+    names, rows = [], []
+    for k, df in data.items():
+        if df is not None:
+            names.append(lmap.get(k, k)); rows.append(len(df))
+
+    fig = go.Figure(go.Bar(x=names, y=rows, marker_color="#f7c948",
+                           marker_line_color="#0d0d0d", marker_line_width=1.5))
+    fig.update_layout(plot_bgcolor="#f7f5f0", paper_bgcolor="#f7f5f0",
+                      font=dict(family="DM Sans"), height=300,
+                      xaxis=dict(showgrid=False), yaxis=dict(gridcolor="#e5e5e5"),
+                      margin=dict(t=10,b=10,l=10,r=10))
+    st.plotly_chart(fig, use_container_width=True)
 
 
-# ==========================================================================
-# STARTUP
-# ==========================================================================
+# ════════════════════════════════════════════════════════════════════════════
+# PAGE 2 · LIVE PREDICTION
+# ════════════════════════════════════════════════════════════════════════════
+elif page == "🔮  Live Prediction":
+    st.markdown("""
+    <div class='hero-title'>Live <span style='color:#f7c948'>Sentiment Predictor</span></div>
+    <div class='hero-sub'>Enter any text — get an instant prediction from your trained model</div>
+    """, unsafe_allow_html=True)
+    st.markdown("<hr class='thin-divider'>", unsafe_allow_html=True)
 
-if __name__ == "__main__":
-    print("\n" + "🚀"*30)
-    print("  AI FINANCIAL AGENT — DEPLOYMENT SERVER")
-    print("🚀"*30)
-    load_models()
-    print("\n  Dashboard → http://localhost:5000")
-    print("  API Docs  → http://localhost:5000/health\n")
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    if not models["classifier"] or not models["vectorizer"]:
+        st.error("⚠️ Model files not found. Ensure `best_model.pkl` and `tfidf_vectorizer.pkl` are in the same folder as `app.py`.")
+    else:
+        # ── Single prediction ──
+        st.markdown("<div class='section-header'>Single Text Prediction</div>", unsafe_allow_html=True)
+
+        ex1, ex2, ex3 = st.columns(3)
+        example_text = st.session_state.get("example_text", "")
+        if ex1.button("📈 Bullish example"):
+            st.session_state["example_text"] = "Zomato IPO is a great investment! Strong growth potential and solid fundamentals."
+            st.rerun()
+        if ex2.button("📉 Bearish example"):
+            st.session_state["example_text"] = "Zomato IPO is way overvalued. Too risky at current price levels."
+            st.rerun()
+        if ex3.button("😐 Neutral example"):
+            st.session_state["example_text"] = "Zomato files for IPO worth Rs 9375 crore. Proceeds to be used for expansion."
+            st.rerun()
+
+        user_input = st.text_area("Enter text to analyze",
+                                  value=st.session_state.get("example_text", ""),
+                                  height=130,
+                                  placeholder="Type a tweet, review, or headline about Zomato IPO...")
+
+        if st.button("🔮  Predict Sentiment", type="primary", use_container_width=True):
+            if user_input.strip():
+                with st.spinner("Analyzing..."):
+                    label, proba, cleaned = predict_sentiment(user_input)
+
+                label_str = norm_label(label)
+                css_cls = {"Positive":"pred-positive","Negative":"pred-negative",
+                           "Neutral":"pred-neutral"}.get(label_str, "pred-neutral")
+                emoji   = {"Positive":"📈","Negative":"📉","Neutral":"➡️"}.get(label_str, "❓")
+
+                col1, col2 = st.columns([1, 2])
+                with col1:
+                    st.markdown(f"""
+                    <div class='{css_cls}'>
+                        <div class='pred-label'>{emoji} {label_str}</div>
+                        <div class='pred-confidence'>Predicted sentiment</div>
+                    </div>""", unsafe_allow_html=True)
+                with col2:
+                    if proba is not None:
+                        le = models["label_encoder"]
+                        clf = models["classifier"]
+                        class_names = ([norm_label(c) for c in le.classes_]
+                                       if le else [str(c) for c in clf.classes_])
+                        proba_df = pd.DataFrame({"Class": class_names, "Probability": proba})
+                        bar_colors = ["#d4f5e2" if c=="Positive"
+                                      else "#fde8e8" if c=="Negative"
+                                      else "#fff3cd" for c in proba_df["Class"]]
+                        fig = go.Figure(go.Bar(
+                            x=proba_df["Class"], y=proba_df["Probability"],
+                            marker_color=bar_colors,
+                            marker_line_color="#0d0d0d", marker_line_width=1.5,
+                            text=[f"{p:.1%}" for p in proba_df["Probability"]],
+                            textposition="outside"
+                        ))
+                        fig.update_layout(
+                            plot_bgcolor="#f7f5f0", paper_bgcolor="#f7f5f0",
+                            font=dict(family="DM Sans"), height=240,
+                            yaxis=dict(range=[0, 1.15], tickformat=".0%"),
+                            margin=dict(t=10,b=10,l=10,r=10),
+                            title=dict(text="Confidence per class", font=dict(size=13))
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                    else:
+                        st.info("This model doesn't support probability estimates (no predict_proba).")
+
+                st.markdown(f"**Cleaned text used:** `{cleaned}`")
+            else:
+                st.warning("Please enter some text first.")
+
+        st.markdown("<hr class='thin-divider'>", unsafe_allow_html=True)
+
+        # ── Batch prediction ──
+        st.markdown("<div class='section-header'>Batch Prediction — Upload CSV</div>", unsafe_allow_html=True)
+        uploaded = st.file_uploader("Upload a CSV file with a text column", type=["csv"])
+
+        if uploaded:
+            batch_df = pd.read_csv(uploaded)
+            text_cols = [c for c in batch_df.columns if batch_df[c].dtype == object]
+            if text_cols:
+                text_col = st.selectbox("Select the text column", text_cols)
+                if st.button("▶️  Run Batch Prediction"):
+                    with st.spinner(f"Predicting {len(batch_df)} rows..."):
+                        preds, confs = [], []
+                        for txt in batch_df[text_col].fillna(""):
+                            lbl, prob, _ = predict_sentiment(str(txt))
+                            preds.append(norm_label(lbl))
+                            confs.append(f"{max(prob):.1%}" if prob is not None else "N/A")
+                        batch_df["predicted_sentiment"] = preds
+                        batch_df["confidence"]          = confs
+
+                    st.success(f"✅ Predicted {len(batch_df)} rows!")
+                    st.dataframe(batch_df, use_container_width=True)
+
+                    counts = batch_df["predicted_sentiment"].value_counts()
+                    fig2 = px.pie(values=counts.values, names=counts.index,
+                                  color_discrete_sequence=["#d4f5e2","#fde8e8","#fff3cd"],
+                                  hole=0.45, title="Batch Sentiment Distribution")
+                    fig2.update_layout(paper_bgcolor="#f7f5f0",
+                                       font=dict(family="DM Sans"), height=300)
+                    st.plotly_chart(fig2, use_container_width=True)
+
+                    st.download_button("⬇️ Download Results as CSV",
+                                       batch_df.to_csv(index=False).encode("utf-8"),
+                                       "predictions.csv", "text/csv")
+            else:
+                st.error("No text columns found in your CSV.")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# PAGE 3 · DATA EXPLORER
+# ════════════════════════════════════════════════════════════════════════════
+elif page == "📊  Data Explorer":
+    st.markdown("""
+    <div class='hero-title'>Data <span style='color:#f7c948'>Explorer</span></div>
+    <div class='hero-sub'>Browse, filter and inspect all cleaned datasets</div>
+    """, unsafe_allow_html=True)
+    st.markdown("<hr class='thin-divider'>", unsafe_allow_html=True)
+
+    lmap = {"ipo_tweets":"IPO Tweets","reviews":"App Reviews","news":"News Articles",
+            "yt_comments":"YouTube Comments","yt_videos":"YouTube Videos",
+            "zomato_reviews":"Zomato Reviews","zomato_ipo":"IPO Data"}
+    available = {k: v for k, v in data.items() if v is not None}
+
+    if not available:
+        st.warning(f"No CSV files found in `{DATA_DIR}/`.")
+    else:
+        key = st.selectbox("Dataset", list(available.keys()),
+                           format_func=lambda k: lmap.get(k, k))
+        df = available[key]
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Rows", fmt(len(df)))
+        c2.metric("Columns", len(df.columns))
+        c3.metric("Missing Values", fmt(int(df.isnull().sum().sum())))
+
+        st.markdown("<div class='section-header'>Preview</div>", unsafe_allow_html=True)
+        n = st.slider("Rows to show", 5, min(200, len(df)), 10)
+        st.dataframe(df.head(n), use_container_width=True)
+
+        num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        if num_cols:
+            st.markdown("<div class='section-header'>Descriptive Statistics</div>", unsafe_allow_html=True)
+            st.dataframe(df[num_cols].describe().round(3), use_container_width=True)
+
+            st.markdown("<div class='section-header'>Column Distribution</div>", unsafe_allow_html=True)
+            col = st.selectbox("Select column", num_cols)
+            fig = px.histogram(df, x=col, nbins=40, color_discrete_sequence=["#f7c948"])
+            fig.update_layout(plot_bgcolor="#f7f5f0", paper_bgcolor="#f7f5f0",
+                              font=dict(family="DM Sans"), height=280,
+                              margin=dict(t=10,b=10,l=10,r=10))
+            st.plotly_chart(fig, use_container_width=True)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# PAGE 4 · MODEL PERFORMANCE
+# ════════════════════════════════════════════════════════════════════════════
+elif page == "🤖  Model Performance":
+    st.markdown("""
+    <div class='hero-title'>Model <span style='color:#f7c948'>Performance</span></div>
+    <div class='hero-sub'>Classification results — Dataset 2 (IPO Tweets / Reviews)</div>
+    """, unsafe_allow_html=True)
+    st.markdown("<hr class='thin-divider'>", unsafe_allow_html=True)
+
+    results = {
+        "Logistic Regression": {
+            "accuracy": 0.50,
+            "report": pd.DataFrame({
+                "Class":     ["-1 Negative","0 Neutral","1 Positive","Macro Avg","Weighted Avg"],
+                "Precision": [0.45,1.00,0.00,0.48,0.52],
+                "Recall":    [1.00,0.25,0.00,0.42,0.50],
+                "F1-Score":  [0.62,0.40,0.00,0.34,0.39],
+                "Support":   [5,4,3,12,12],
+            })
+        },
+        "SVM": {
+            "accuracy": 0.5833,
+            "report": pd.DataFrame({
+                "Class":     ["-1 Negative","0 Neutral","1 Positive","Macro Avg","Weighted Avg"],
+                "Precision": [0.50,1.00,1.00,0.83,0.75],
+                "Recall":    [1.00,0.25,0.33,0.53,0.58],
+                "F1-Score":  [0.67,0.40,0.50,0.52,0.56],
+                "Support":   [5,4,3,12,12],
+            })
+        },
+    }
+
+    model_name = st.selectbox("Select Model", list(results.keys()))
+    res = results[model_name]
+    acc = res["accuracy"]
+    rep = res["report"]
+
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        fig = go.Figure(go.Indicator(
+            mode="gauge+number",
+            value=acc * 100,
+            number={"suffix":"%","font":{"size":36,"family":"Syne"}},
+            title={"text":"Accuracy","font":{"size":14,"family":"DM Sans"}},
+            gauge={"axis":{"range":[0,100]},
+                   "bar":{"color":"#f7c948"},
+                   "steps":[{"range":[0,50],"color":"#fde8e8"},
+                             {"range":[50,70],"color":"#fff3cd"},
+                             {"range":[70,100],"color":"#d4f5e2"}],
+                   "threshold":{"line":{"color":"#0d0d0d","width":3},"value":acc*100}}
+        ))
+        fig.update_layout(height=260, paper_bgcolor="#f7f5f0",
+                          margin=dict(t=30,b=10,l=20,r=20),
+                          font=dict(family="DM Sans"))
+        st.plotly_chart(fig, use_container_width=True)
+
+    with col2:
+        st.markdown("<div class='section-header'>Classification Report</div>", unsafe_allow_html=True)
+        st.dataframe(
+            rep.set_index("Class").style.format("{:.2f}",
+                subset=["Precision","Recall","F1-Score"]),
+            use_container_width=True
+        )
+
+    st.markdown("<div class='section-header'>Precision · Recall · F1 by Class</div>", unsafe_allow_html=True)
+    core = rep[~rep["Class"].str.contains("Avg")]
+    fig2 = go.Figure()
+    for metric, color in [("Precision","#f7c948"),("Recall","#0d0d0d"),("F1-Score","#aaa")]:
+        fig2.add_trace(go.Bar(name=metric, x=core["Class"], y=core[metric],
+                              marker_color=color))
+    fig2.update_layout(barmode="group", plot_bgcolor="#f7f5f0", paper_bgcolor="#f7f5f0",
+                       font=dict(family="DM Sans"), height=300,
+                       legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                       margin=dict(t=30,b=10,l=10,r=10))
+    st.plotly_chart(fig2, use_container_width=True)
+
+    st.markdown("<div class='section-header'>Feature Engineering Summary</div>", unsafe_allow_html=True)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Samples", "60")
+    c2.metric("TF-IDF Features", "5,000")
+    c3.metric("Train Set", "48 (80%)")
+    c4.metric("Test Set", "12 (20%)")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# PAGE 5 · SENTIMENT ANALYSIS
+# ════════════════════════════════════════════════════════════════════════════
+elif page == "💬  Sentiment Analysis":
+    st.markdown("""
+    <div class='hero-title'>Sentiment <span style='color:#f7c948'>Analysis</span></div>
+    <div class='hero-sub'>Explore sentiment distributions across data sources</div>
+    """, unsafe_allow_html=True)
+    st.markdown("<hr class='thin-divider'>", unsafe_allow_html=True)
+
+    lmap = {"ipo_tweets":"IPO Tweets","reviews":"App Reviews","news":"News Articles",
+            "yt_comments":"YouTube Comments","yt_videos":"YouTube Videos",
+            "zomato_reviews":"Zomato Reviews","zomato_ipo":"IPO Data"}
+    available = {k: v for k, v in data.items() if v is not None}
+
+    key = st.selectbox("Data Source", list(available.keys()),
+                       format_func=lambda k: lmap.get(k, k))
+    df  = available[key]
+    sent_col = next((c for c in df.columns
+                     if "sentiment" in c.lower() or "label" in c.lower()), None)
+
+    if sent_col:
+        counts = df[sent_col].value_counts().reset_index()
+        counts.columns = ["Sentiment","Count"]
+        counts["Sentiment"] = counts["Sentiment"].apply(norm_label)
+
+        col1, col2 = st.columns(2)
+        with col1:
+            fig = px.pie(counts, values="Count", names="Sentiment", hole=0.45,
+                         color_discrete_sequence=["#f7c948","#0d0d0d","#aaa"])
+            fig.update_layout(paper_bgcolor="#f7f5f0", font=dict(family="DM Sans"),
+                              height=320, margin=dict(t=20,b=20,l=20,r=20))
+            st.plotly_chart(fig, use_container_width=True)
+        with col2:
+            fig2 = go.Figure(go.Bar(
+                x=counts["Sentiment"], y=counts["Count"],
+                marker_color=["#f7c948","#0d0d0d","#aaa"][:len(counts)],
+                marker_line_color="#0d0d0d", marker_line_width=1
+            ))
+            fig2.update_layout(plot_bgcolor="#f7f5f0", paper_bgcolor="#f7f5f0",
+                               font=dict(family="DM Sans"), height=320,
+                               margin=dict(t=10,b=10,l=10,r=10))
+            st.plotly_chart(fig2, use_container_width=True)
+
+        filt = st.selectbox("Filter by sentiment",
+                            ["All"] + df[sent_col].unique().tolist())
+        filtered = df if filt == "All" else df[df[sent_col] == filt]
+        st.dataframe(filtered.head(30), use_container_width=True)
+    else:
+        st.info(f"No sentiment column detected. Columns available: {', '.join(df.columns[:10])}")
+        st.dataframe(df.head(20), use_container_width=True)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# PAGE 6 · NEWS & SOCIAL
+# ════════════════════════════════════════════════════════════════════════════
+elif page == "📰  News & Social":
+    st.markdown("""
+    <div class='hero-title'>News & <span style='color:#f7c948'>Social Media</span></div>
+    <div class='hero-sub'>Media and social signals around the Zomato IPO</div>
+    """, unsafe_allow_html=True)
+    st.markdown("<hr class='thin-divider'>", unsafe_allow_html=True)
+
+    tabs = st.tabs(["📰 News", "🐦 IPO Tweets", "▶️ YouTube"])
+
+    with tabs[0]:
+        if data["news"] is not None:
+            df = data["news"]
+            st.metric("Articles", len(df))
+            text_c = next((c for c in df.columns
+                           if "title" in c.lower() or "text" in c.lower()), df.columns[0])
+            search = st.text_input("Search news", "", key="news_s")
+            disp = df[df[text_c].astype(str).str.contains(search, case=False)] if search else df
+            st.dataframe(disp.head(30), use_container_width=True)
+        else:
+            st.warning("`news_zomato.csv` not found in `cleaned_data/`")
+
+    with tabs[1]:
+        if data["ipo_tweets"] is not None:
+            df = data["ipo_tweets"]
+            c1, c2 = st.columns(2)
+            c1.metric("Tweets", len(df))
+            c2.metric("Columns", len(df.columns))
+            text_c = next((c for c in df.columns
+                           if "text" in c.lower() or "tweet" in c.lower()), df.columns[0])
+            search = st.text_input("Search tweets", "", key="tweet_s")
+            disp = df[df[text_c].astype(str).str.contains(search, case=False)] if search else df
+            st.dataframe(disp.head(30), use_container_width=True)
+        else:
+            st.warning("`ipo_tweets_clean.csv` not found in `cleaned_data/`")
+
+    with tabs[2]:
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**Videos**")
+            if data["yt_videos"] is not None:
+                st.metric("Videos", len(data["yt_videos"]))
+                st.dataframe(data["yt_videos"].head(15), use_container_width=True)
+            else:
+                st.warning("`youtube_videos_zomato.csv` not found")
+        with c2:
+            st.markdown("**Comments**")
+            if data["yt_comments"] is not None:
+                st.metric("Comments", len(data["yt_comments"]))
+                st.dataframe(data["yt_comments"].head(15), use_container_width=True)
+            else:
+                st.warning("`youtube_comments_zomato.csv` not found")
